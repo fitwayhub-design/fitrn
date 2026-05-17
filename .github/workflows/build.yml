@@ -7,6 +7,15 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      zip_url:
+        description: 'Optional URL to a source zip to build instead of the repo checkout'
+        required: false
+        type: string
+      release_tag:
+        description: 'Optional tag name to publish as a GitHub Release'
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -24,7 +33,23 @@ jobs:
       apk-path: ${{ steps.locate.outputs.apk }}
     steps:
       - name: Checkout
+        if: ${{ github.event.inputs.zip_url == '' }}
         uses: actions/checkout@v4
+
+      - name: Download source zip
+        if: ${{ github.event.inputs.zip_url != '' }}
+        run: |
+          curl -fSL --retry 5 --retry-delay 3 -o source.zip "${{ github.event.inputs.zip_url }}"
+          unzip -q source.zip -d _src
+          # If the zip wraps everything in a single top-level dir, flatten it.
+          shopt -s dotglob
+          ENTRIES=(_src/*)
+          if [ ${#ENTRIES[@]} -eq 1 ] && [ -d "${ENTRIES[0]}" ]; then
+            mv "${ENTRIES[0]}"/* .
+          else
+            mv _src/* .
+          fi
+          rm -rf _src source.zip
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -94,7 +119,22 @@ jobs:
       ipa-path: ${{ steps.locate.outputs.ipa }}
     steps:
       - name: Checkout
+        if: ${{ github.event.inputs.zip_url == '' }}
         uses: actions/checkout@v4
+
+      - name: Download source zip
+        if: ${{ github.event.inputs.zip_url != '' }}
+        run: |
+          curl -fSL --retry 5 --retry-delay 3 -o source.zip "${{ github.event.inputs.zip_url }}"
+          unzip -q source.zip -d _src
+          shopt -s dotglob || true
+          ENTRIES=(_src/*)
+          if [ ${#ENTRIES[@]} -eq 1 ] && [ -d "${ENTRIES[0]}" ]; then
+            mv "${ENTRIES[0]}"/* .
+          else
+            mv _src/* .
+          fi
+          rm -rf _src source.zip
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
