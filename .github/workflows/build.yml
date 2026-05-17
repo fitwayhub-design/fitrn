@@ -183,16 +183,30 @@ jobs:
         shell: bash
         working-directory: project
         run: |
-          # If the uploaded ios/ scaffold is missing the Podfile, regenerate it
-          if [ ! -f ios/App/Podfile ] && [ ! -f ios/Podfile ]; then
-            echo "Podfile missing under ios/ — regenerating iOS Capacitor scaffold via 'cap add ios'"
+          set -e
+          echo "=== Capacitor versions ==="
+          npx --no-install cap --version 2>/dev/null || echo "(cap CLI not directly installed)"
+          npm ls @capacitor/core @capacitor/cli @capacitor/ios --depth=0 2>&1 | head -20 || true
+
+          echo "=== ios/ tree BEFORE sync ==="
+          find ios -maxdepth 3 -print 2>/dev/null || echo "(no ios/ dir)"
+
+          # If scaffold is incomplete (Podfile missing AND no Package.swift), nuke and regenerate
+          if [ ! -f ios/App/Podfile ] && [ ! -f ios/Podfile ] && [ ! -f ios/App/Package.swift ]; then
+            echo ">> ios/ scaffold incomplete — wiping and running 'cap add ios'"
             rm -rf ios
+            # Ensure @capacitor/ios is installed so cap add ios can find a template
+            if ! npm ls @capacitor/ios --depth=0 >/dev/null 2>&1; then
+              echo ">> @capacitor/ios not installed — installing"
+              npm install --no-audit --no-fund @capacitor/ios
+            fi
             npx cap add ios
           fi
+
           npx cap sync ios
-          echo "--- ios/ tree after sync ---"
-          ls -la ios || true
-          ls -la ios/App || true
+
+          echo "=== ios/ tree AFTER sync ==="
+          find ios -maxdepth 3 -print 2>/dev/null || true
 
       - name: Expo prebuild (iOS)
         if: steps.detect.outputs.type == 'expo'
@@ -204,17 +218,29 @@ jobs:
         shell: bash
         working-directory: project
         run: |
-          if [ -f ios/App/Podfile ]; then
-            echo "dir=ios/App" >> "$GITHUB_OUTPUT"
-          elif [ -f ios/Podfile ]; then
-            echo "dir=ios" >> "$GITHUB_OUTPUT"
-          else
-            echo "::error::Could not find a Podfile under ios/ or ios/App/"
-            ls -la ios || true
+          # Find any directory under ios/ that contains an .xcworkspace or .xcodeproj
+          candidate=""
+          for d in ios/App ios; do
+            if ls "$d"/*.xcworkspace >/dev/null 2>&1 || ls "$d"/*.xcodeproj >/dev/null 2>&1; then
+              candidate="$d"
+              break
+            fi
+          done
+          if [ -z "$candidate" ]; then
+            echo "::error::Could not find an .xcworkspace or .xcodeproj under ios/ or ios/App/"
+            find ios -maxdepth 3 -print 2>/dev/null || true
             exit 1
           fi
+          echo "dir=$candidate" >> "$GITHUB_OUTPUT"
+          if [ -f "$candidate/Podfile" ]; then
+            echo "uses_pods=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "uses_pods=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Using iOS dir: $candidate (Podfile present: $([ -f "$candidate/Podfile" ] && echo yes || echo no))"
 
       - name: Install CocoaPods
+        if: steps.iosdir.outputs.uses_pods == 'true'
         shell: bash
         working-directory: project/${{ steps.iosdir.outputs.dir }}
         run: pod install --repo-update
@@ -223,10 +249,24 @@ jobs:
         shell: bash
         working-directory: project/${{ steps.iosdir.outputs.dir }}
         run: |
-          WORKSPACE=$(ls *.xcworkspace | head -n1)
-          SCHEME=$(basename "$WORKSPACE" .xcworkspace)
+          if [ "${{ steps.iosdir.outputs.uses_pods }}" = "true" ]; then
+            CONTAINER=$(ls *.xcworkspace | head -n1)
+            CONTAINER_FLAG="-workspace"
+            SCHEME=$(basename "$CONTAINER" .xcworkspace)
+          else
+            CONTAINER=$(ls *.xcworkspace 2>/dev/null | head -n1)
+            if [ -n "$CONTAINER" ]; then
+              CONTAINER_FLAG="-workspace"
+              SCHEME=$(basename "$CONTAINER" .xcworkspace)
+            else
+              CONTAINER=$(ls *.xcodeproj | head -n1)
+              CONTAINER_FLAG="-project"
+              SCHEME=$(basename "$CONTAINER" .xcodeproj)
+            fi
+          fi
+          echo "Building $CONTAINER_FLAG $CONTAINER scheme $SCHEME"
           xcodebuild \
-            -workspace "$WORKSPACE" \
+            $CONTAINER_FLAG "$CONTAINER" \
             -scheme "$SCHEME" \
             -configuration Release \
             -sdk iphoneos \
