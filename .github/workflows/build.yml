@@ -84,6 +84,19 @@ jobs:
             npm install --no-audit --no-fund
           fi
 
+      - name: Ensure native Android project (Expo prebuild)
+        run: |
+          if [ ! -d android ]; then
+            if [ -f app.json ] || [ -f app.config.js ] || [ -f app.config.ts ]; then
+              echo "No android/ folder found, running expo prebuild..."
+              npx --yes expo prebuild --platform android --non-interactive --no-install
+            else
+              echo "::error::No android/ directory and no Expo config (app.json / app.config.{js,ts}). Cannot build."
+              ls -la
+              exit 1
+            fi
+          fi
+
       - name: Decode release keystore
         if: ${{ env.ANDROID_KEYSTORE_BASE64 != '' }}
         env:
@@ -152,13 +165,6 @@ jobs:
           ruby-version: ${{ env.RUBY_VERSION }}
           bundler-cache: false
 
-      - name: Install Bundler dependencies
-        working-directory: ios
-        run: |
-          if [ -f Gemfile ]; then
-            bundle install
-          fi
-
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode_15.4.app
 
@@ -168,6 +174,26 @@ jobs:
             npm ci --no-audit --no-fund
           else
             npm install --no-audit --no-fund
+          fi
+
+      - name: Ensure native iOS project (Expo prebuild)
+        run: |
+          if [ ! -d ios ]; then
+            if [ -f app.json ] || [ -f app.config.js ] || [ -f app.config.ts ]; then
+              echo "No ios/ folder found, running expo prebuild..."
+              npx --yes expo prebuild --platform ios --non-interactive --no-install
+            else
+              echo "::error::No ios/ directory and no Expo config (app.json / app.config.{js,ts}). Cannot build."
+              ls -la
+              exit 1
+            fi
+          fi
+
+      - name: Install Bundler dependencies
+        working-directory: ios
+        run: |
+          if [ -f Gemfile ]; then
+            bundle install
           fi
 
       - name: Cache CocoaPods
