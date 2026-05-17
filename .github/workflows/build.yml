@@ -86,16 +86,34 @@ jobs:
 
       - name: Ensure native Android project (Expo prebuild)
         run: |
-          if [ ! -d android ]; then
-            if [ -f app.json ] || [ -f app.config.js ] || [ -f app.config.ts ]; then
-              echo "No android/ folder found, running expo prebuild..."
-              npx --yes expo prebuild --platform android --non-interactive --no-install
-            else
-              echo "::error::No android/ directory and no Expo config (app.json / app.config.{js,ts}). Cannot build."
-              ls -la
-              exit 1
-            fi
+          set -euo pipefail
+          if [ -d android ]; then
+            echo "android/ already present — skipping prebuild."
+            exit 0
           fi
+          if [ ! -f package.json ]; then
+            echo "::error::No package.json in source. Upload a React Native or Expo project."
+            ls -la
+            exit 1
+          fi
+          if [ ! -f app.json ] && [ ! -f app.config.js ] && [ ! -f app.config.ts ]; then
+            echo "No Expo config found, bootstrapping a minimal app.json..."
+            APP_NAME=$(node -p "require('./package.json').name || 'fitrn'")
+            node -e "
+              const fs=require('fs');
+              const pkg=require('./package.json');
+              const slug=(pkg.name||'fitrn').replace(/[^a-zA-Z0-9-]/g,'-').toLowerCase();
+              const cfg={expo:{name:pkg.name||'fitrn',slug,version:pkg.version||'1.0.0',android:{package:'com.'+slug.replace(/-/g,'')+'.app'},ios:{bundleIdentifier:'com.'+slug.replace(/-/g,'')+'.app'}}};
+              fs.writeFileSync('app.json',JSON.stringify(cfg,null,2));
+            "
+            cat app.json
+          fi
+          if ! node -e "require('expo/package.json')" 2>/dev/null; then
+            echo "Installing expo package locally..."
+            npm install --no-audit --no-fund expo
+          fi
+          echo "Running expo prebuild for android..."
+          npx --yes expo prebuild --platform android --non-interactive --no-install
 
       - name: Decode release keystore
         if: ${{ env.ANDROID_KEYSTORE_BASE64 != '' }}
@@ -178,16 +196,33 @@ jobs:
 
       - name: Ensure native iOS project (Expo prebuild)
         run: |
-          if [ ! -d ios ]; then
-            if [ -f app.json ] || [ -f app.config.js ] || [ -f app.config.ts ]; then
-              echo "No ios/ folder found, running expo prebuild..."
-              npx --yes expo prebuild --platform ios --non-interactive --no-install
-            else
-              echo "::error::No ios/ directory and no Expo config (app.json / app.config.{js,ts}). Cannot build."
-              ls -la
-              exit 1
-            fi
+          set -euo pipefail
+          if [ -d ios ]; then
+            echo "ios/ already present — skipping prebuild."
+            exit 0
           fi
+          if [ ! -f package.json ]; then
+            echo "::error::No package.json in source. Upload a React Native or Expo project."
+            ls -la
+            exit 1
+          fi
+          if [ ! -f app.json ] && [ ! -f app.config.js ] && [ ! -f app.config.ts ]; then
+            echo "No Expo config found, bootstrapping a minimal app.json..."
+            node -e "
+              const fs=require('fs');
+              const pkg=require('./package.json');
+              const slug=(pkg.name||'fitrn').replace(/[^a-zA-Z0-9-]/g,'-').toLowerCase();
+              const cfg={expo:{name:pkg.name||'fitrn',slug,version:pkg.version||'1.0.0',android:{package:'com.'+slug.replace(/-/g,'')+'.app'},ios:{bundleIdentifier:'com.'+slug.replace(/-/g,'')+'.app'}}};
+              fs.writeFileSync('app.json',JSON.stringify(cfg,null,2));
+            "
+            cat app.json
+          fi
+          if ! node -e "require('expo/package.json')" 2>/dev/null; then
+            echo "Installing expo package locally..."
+            npm install --no-audit --no-fund expo
+          fi
+          echo "Running expo prebuild for ios..."
+          npx --yes expo prebuild --platform ios --non-interactive --no-install
 
       - name: Install Bundler dependencies
         working-directory: ios
