@@ -60,7 +60,7 @@ jobs:
         uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: "21"
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
@@ -182,7 +182,17 @@ jobs:
         if: steps.detect.outputs.type == 'capacitor'
         shell: bash
         working-directory: project
-        run: npx cap sync ios
+        run: |
+          # If the uploaded ios/ scaffold is missing the Podfile, regenerate it
+          if [ ! -f ios/App/Podfile ] && [ ! -f ios/Podfile ]; then
+            echo "Podfile missing under ios/ — regenerating iOS Capacitor scaffold via 'cap add ios'"
+            rm -rf ios
+            npx cap add ios
+          fi
+          npx cap sync ios
+          echo "--- ios/ tree after sync ---"
+          ls -la ios || true
+          ls -la ios/App || true
 
       - name: Expo prebuild (iOS)
         if: steps.detect.outputs.type == 'expo'
