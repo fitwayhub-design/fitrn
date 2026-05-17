@@ -1,377 +1,187 @@
-name: Build & Release (Android APK + iOS IPA)
+name: Build mobile apps
 
 on:
-  push:
-    tags:
-      - 'v*'
-    branches:
-      - main
   workflow_dispatch:
     inputs:
       zip_url:
-        description: 'Optional URL to a source zip to build instead of the repo checkout'
-        required: false
+        description: "URL of the project zip to build"
+        required: true
         type: string
-      release_tag:
-        description: 'Optional tag name to publish as a GitHub Release'
-        required: false
-        type: string
-
-permissions:
-  contents: write
-
-env:
-  NODE_VERSION: '20'
-  JAVA_VERSION: '17'
-  RUBY_VERSION: '3.2'
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 jobs:
   android:
     name: Build Android APK
     runs-on: ubuntu-latest
-    outputs:
-      apk-path: ${{ steps.locate.outputs.apk }}
     steps:
-      - name: Checkout
-        if: ${{ github.event.inputs.zip_url == '' }}
-        uses: actions/checkout@v4
+      - name: Download project zip
+        run: curl -L --fail --retry 3 -o project.zip "${{ inputs.zip_url }}"
 
-      - name: Download source zip
-        if: ${{ github.event.inputs.zip_url != '' }}
+      - name: Unzip project
         run: |
-          curl -fSL --retry 5 --retry-delay 3 -o source.zip "${{ github.event.inputs.zip_url }}"
-          unzip -q source.zip -d _src
-          # If the zip wraps everything in a single top-level dir, flatten it.
-          shopt -s dotglob
-          ENTRIES=(_src/*)
-          if [ ${#ENTRIES[@]} -eq 1 ] && [ -d "${ENTRIES[0]}" ]; then
-            mv "${ENTRIES[0]}"/* .
-          else
-            mv _src/* .
+          mkdir -p project
+          unzip -q project.zip -d project
+          # If everything is wrapped in a single top-level folder, descend into it
+          entries=( project/* )
+          if [ ${#entries[@]} -eq 1 ] && [ -d "${entries[0]}" ]; then
+            mv project project_outer
+            mv "project_outer/${entries[0]##*/}" project
+            rm -rf project_outer
           fi
-          rm -rf _src source.zip
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-
-      - name: Setup JDK
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: ${{ env.JAVA_VERSION }}
-
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Cache Gradle
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: ${{ runner.os }}-gradle-${{ hashFiles('android/**/*.gradle*', 'android/**/gradle-wrapper.properties') }}
-          restore-keys: |
-            ${{ runner.os }}-gradle-
-
-      - name: Install JS dependencies
-        run: |
-          if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
-            npm ci --no-audit --no-fund
-          else
-            npm install --no-audit --no-fund
+          if [ ! -f project/package.json ]; then
+            echo "::error::package.json not found at project root after unzip"
+            ls -la project
+            exit 1
           fi
+        shell: bash
 
-      - name: Ensure native Android project (Expo prebuild)
+      - name: Detect project type
+        id: detect
+        working-directory: project
         run: |
-          set -euo pipefail
           if [ -d android ]; then
-            echo "android/ already present — skipping prebuild."
-            exit 0
-          fi
-          if [ ! -f package.json ]; then
-            echo "::error::No package.json in source. Upload a React Native or Expo project."
+            echo "type=native" >> "$GITHUB_OUTPUT"
+          elif [ -f app.json ] || [ -f app.config.js ] || [ -f app.config.ts ]; then
+            echo "type=expo" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::No android/ directory and no Expo config (app.json / app.config.{js,ts}). Cannot build."
             ls -la
             exit 1
           fi
-          if [ ! -f app.json ] && [ ! -f app.config.js ] && [ ! -f app.config.ts ]; then
-            echo "No Expo config found, bootstrapping a minimal app.json..."
-            APP_NAME=$(node -p "require('./package.json').name || 'fitrn'")
-            node -e "
-              const fs=require('fs');
-              const pkg=require('./package.json');
-              const slug=(pkg.name||'fitrn').replace(/[^a-zA-Z0-9-]/g,'-').toLowerCase();
-              const cfg={expo:{name:pkg.name||'fitrn',slug,version:pkg.version||'1.0.0',android:{package:'com.'+slug.replace(/-/g,'')+'.app'},ios:{bundleIdentifier:'com.'+slug.replace(/-/g,'')+'.app'}}};
-              fs.writeFileSync('app.json',JSON.stringify(cfg,null,2));
-            "
-            cat app.json
-          fi
-          if ! node -e "require('expo/package.json')" 2>/dev/null; then
-            echo "Installing expo package locally..."
-            npm install --no-audit --no-fund expo
-          fi
-          echo "Running expo prebuild for android..."
-          npx --yes expo prebuild --platform android --non-interactive --no-install
+        shell: bash
 
-      - name: Decode release keystore
-        if: ${{ env.ANDROID_KEYSTORE_BASE64 != '' }}
-        env:
-          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install npm dependencies
+        working-directory: project
         run: |
-          echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > android/app/release.keystore
+          if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+            npm ci
+          else
+            npm install --no-audit --no-fund
+          fi
+        shell: bash
 
-      - name: Make gradlew executable
-        run: chmod +x android/gradlew
+      - name: Expo prebuild (Android)
+        if: steps.detect.outputs.type == 'expo'
+        working-directory: project
+        run: npx expo prebuild --platform android --no-install --clean
 
-      - name: Build release APK
-        working-directory: android
-        env:
-          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        run: ./gradlew assembleRelease --no-daemon --stacktrace
-
-      - name: Locate APK
-        id: locate
+      - name: Build APK
+        working-directory: project/android
         run: |
-          APK=$(find android/app/build/outputs/apk/release -name "*.apk" | head -n 1)
-          echo "apk=$APK" >> "$GITHUB_OUTPUT"
-          echo "Built APK: $APK"
+          chmod +x ./gradlew
+          ./gradlew assembleRelease --no-daemon
+        shell: bash
 
-      - name: Upload APK artifact
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: app-release-apk
-          path: android/app/build/outputs/apk/release/*.apk
+          name: android-apk
+          path: project/android/app/build/outputs/apk/release/*.apk
           if-no-files-found: error
-          retention-days: 30
 
   ios:
     name: Build iOS IPA
-    runs-on: macos-14
-    outputs:
-      ipa-path: ${{ steps.locate.outputs.ipa }}
+    runs-on: macos-latest
     steps:
-      - name: Checkout
-        if: ${{ github.event.inputs.zip_url == '' }}
-        uses: actions/checkout@v4
+      - name: Download project zip
+        run: curl -L --fail --retry 3 -o project.zip "${{ inputs.zip_url }}"
 
-      - name: Download source zip
-        if: ${{ github.event.inputs.zip_url != '' }}
+      - name: Unzip project
         run: |
-          curl -fSL --retry 5 --retry-delay 3 -o source.zip "${{ github.event.inputs.zip_url }}"
-          unzip -q source.zip -d _src
-          shopt -s dotglob || true
-          ENTRIES=(_src/*)
-          if [ ${#ENTRIES[@]} -eq 1 ] && [ -d "${ENTRIES[0]}" ]; then
-            mv "${ENTRIES[0]}"/* .
-          else
-            mv _src/* .
+          mkdir -p project
+          unzip -q project.zip -d project
+          entries=( project/* )
+          if [ ${#entries[@]} -eq 1 ] && [ -d "${entries[0]}" ]; then
+            mv project project_outer
+            mv "project_outer/${entries[0]##*/}" project
+            rm -rf project_outer
           fi
-          rm -rf _src source.zip
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-
-      - name: Setup Ruby
-        uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: ${{ env.RUBY_VERSION }}
-          bundler-cache: false
-
-      - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode_15.4.app
-
-      - name: Install JS dependencies
-        run: |
-          if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
-            npm ci --no-audit --no-fund
-          else
-            npm install --no-audit --no-fund
+          if [ ! -f project/package.json ]; then
+            echo "::error::package.json not found at project root after unzip"
+            ls -la project
+            exit 1
           fi
+        shell: bash
 
-      - name: Ensure native iOS project (Expo prebuild)
+      - name: Detect project type
+        id: detect
+        working-directory: project
         run: |
-          set -euo pipefail
           if [ -d ios ]; then
-            echo "ios/ already present — skipping prebuild."
-            exit 0
-          fi
-          if [ ! -f package.json ]; then
-            echo "::error::No package.json in source. Upload a React Native or Expo project."
+            echo "type=native" >> "$GITHUB_OUTPUT"
+          elif [ -f app.json ] || [ -f app.config.js ] || [ -f app.config.ts ]; then
+            echo "type=expo" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::No ios/ directory and no Expo config (app.json / app.config.{js,ts}). Cannot build."
             ls -la
             exit 1
           fi
-          if [ ! -f app.json ] && [ ! -f app.config.js ] && [ ! -f app.config.ts ]; then
-            echo "No Expo config found, bootstrapping a minimal app.json..."
-            node -e "
-              const fs=require('fs');
-              const pkg=require('./package.json');
-              const slug=(pkg.name||'fitrn').replace(/[^a-zA-Z0-9-]/g,'-').toLowerCase();
-              const cfg={expo:{name:pkg.name||'fitrn',slug,version:pkg.version||'1.0.0',android:{package:'com.'+slug.replace(/-/g,'')+'.app'},ios:{bundleIdentifier:'com.'+slug.replace(/-/g,'')+'.app'}}};
-              fs.writeFileSync('app.json',JSON.stringify(cfg,null,2));
-            "
-            cat app.json
-          fi
-          if ! node -e "require('expo/package.json')" 2>/dev/null; then
-            echo "Installing expo package locally..."
-            npm install --no-audit --no-fund expo
-          fi
-          echo "Running expo prebuild for ios..."
-          npx --yes expo prebuild --platform ios --non-interactive --no-install
+        shell: bash
 
-      - name: Install Bundler dependencies
-        working-directory: ios
-        run: |
-          if [ -f Gemfile ]; then
-            bundle install
-          fi
-
-      - name: Cache CocoaPods
-        uses: actions/cache@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
         with:
-          path: ios/Pods
-          key: ${{ runner.os }}-pods-${{ hashFiles('ios/Podfile.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-pods-
+          node-version: "24"
+
+      - name: Install npm dependencies
+        working-directory: project
+        run: |
+          if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+            npm ci
+          else
+            npm install --no-audit --no-fund
+          fi
+        shell: bash
+
+      - name: Expo prebuild (iOS)
+        if: steps.detect.outputs.type == 'expo'
+        working-directory: project
+        run: npx expo prebuild --platform ios --no-install --clean
 
       - name: Install CocoaPods
-        working-directory: ios
-        run: |
-          if [ -f Gemfile ] && [ -f Gemfile.lock ]; then
-            bundle exec pod install --repo-update
-          else
-            pod install --repo-update
-          fi
-
-      - name: Import signing certificate
-        env:
-          IOS_DIST_CERT_BASE64: ${{ secrets.IOS_DIST_CERT_BASE64 }}
-          IOS_DIST_CERT_PASSWORD: ${{ secrets.IOS_DIST_CERT_PASSWORD }}
-          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
-        run: |
-          CERT_PATH=$RUNNER_TEMP/dist.p12
-          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
-          echo "$IOS_DIST_CERT_BASE64" | base64 --decode > "$CERT_PATH"
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security import "$CERT_PATH" -P "$IOS_DIST_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
-          security list-keychain -d user -s "$KEYCHAIN_PATH"
-
-      - name: Install provisioning profile
-        env:
-          IOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
-        run: |
-          PROFILE_PATH=$RUNNER_TEMP/profile.mobileprovision
-          echo "$IOS_PROVISIONING_PROFILE_BASE64" | base64 --decode > "$PROFILE_PATH"
-          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
-          cp "$PROFILE_PATH" ~/Library/MobileDevice/Provisioning\ Profiles/
+        working-directory: project/ios
+        run: pod install --repo-update
 
       - name: Build archive
-        working-directory: ios
-        env:
-          IOS_SCHEME: ${{ vars.IOS_SCHEME || 'fitrn' }}
-          IOS_WORKSPACE: ${{ vars.IOS_WORKSPACE || 'fitrn.xcworkspace' }}
+        working-directory: project/ios
         run: |
+          WORKSPACE=$(ls *.xcworkspace | head -n1)
+          SCHEME=$(basename "$WORKSPACE" .xcworkspace)
           xcodebuild \
-            -workspace "$IOS_WORKSPACE" \
-            -scheme "$IOS_SCHEME" \
+            -workspace "$WORKSPACE" \
+            -scheme "$SCHEME" \
             -configuration Release \
             -sdk iphoneos \
-            -destination 'generic/platform=iOS' \
-            -archivePath "$RUNNER_TEMP/app.xcarchive" \
-            archive \
-            CODE_SIGN_STYLE=Manual \
-            DEVELOPMENT_TEAM=${{ secrets.IOS_TEAM_ID }} \
-            PROVISIONING_PROFILE_SPECIFIER="${{ secrets.IOS_PROVISIONING_PROFILE_NAME }}"
+            -derivedDataPath build \
+            -archivePath build/App.xcarchive \
+            CODE_SIGNING_ALLOWED=NO \
+            archive
+        shell: bash
 
-      - name: Export IPA
-        env:
-          IOS_TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
-          IOS_BUNDLE_ID: ${{ vars.IOS_BUNDLE_ID }}
-          IOS_PROVISIONING_PROFILE_NAME: ${{ secrets.IOS_PROVISIONING_PROFILE_NAME }}
+      - name: Package unsigned IPA
+        working-directory: project/ios
         run: |
-          cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>method</key>
-            <string>app-store</string>
-            <key>teamID</key>
-            <string>${IOS_TEAM_ID}</string>
-            <key>signingStyle</key>
-            <string>manual</string>
-            <key>provisioningProfiles</key>
-            <dict>
-              <key>${IOS_BUNDLE_ID}</key>
-              <string>${IOS_PROVISIONING_PROFILE_NAME}</string>
-            </dict>
-            <key>stripSwiftSymbols</key>
-            <true/>
-            <key>compileBitcode</key>
-            <false/>
-          </dict>
-          </plist>
-          EOF
-          xcodebuild \
-            -exportArchive \
-            -archivePath "$RUNNER_TEMP/app.xcarchive" \
-            -exportPath "$RUNNER_TEMP/ipa" \
-            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist"
+          mkdir -p build/ipa/Payload
+          cp -R build/App.xcarchive/Products/Applications/*.app build/ipa/Payload/
+          cd build/ipa && zip -qr ../App.ipa Payload
+        shell: bash
 
-      - name: Locate IPA
-        id: locate
-        run: |
-          IPA=$(find "$RUNNER_TEMP/ipa" -name "*.ipa" | head -n 1)
-          cp "$IPA" "$RUNNER_TEMP/app-release.ipa"
-          echo "ipa=$RUNNER_TEMP/app-release.ipa" >> "$GITHUB_OUTPUT"
-
-      - name: Upload IPA artifact
+      - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: app-release-ipa
-          path: ${{ runner.temp }}/app-release.ipa
+          name: ios-ipa
+          path: project/ios/build/App.ipa
           if-no-files-found: error
-          retention-days: 30
-
-  release:
-    name: Publish GitHub Release
-    needs: [android, ios]
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download Android APK
-        uses: actions/download-artifact@v4
-        with:
-          name: app-release-apk
-          path: ./release/android
-
-      - name: Download iOS IPA
-        uses: actions/download-artifact@v4
-        with:
-          name: app-release-ipa
-          path: ./release/ios
-
-      - name: Rename artifacts
-        run: |
-          mkdir -p ./release/dist
-          mv ./release/android/*.apk "./release/dist/fitrn-${{ github.ref_name }}.apk"
-          mv ./release/ios/*.ipa "./release/dist/fitrn-${{ github.ref_name }}.ipa"
-          ls -la ./release/dist
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: Release ${{ github.ref_name }}
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-          files: |
-            ./release/dist/fitrn-${{ github.ref_name }}.apk
-            ./release/dist/fitrn-${{ github.ref_name }}.ipa
