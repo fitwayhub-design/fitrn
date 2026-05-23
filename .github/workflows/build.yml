@@ -8,6 +8,24 @@ on:
         required: true
         type: string
 
+# iOS signing (optional). The job auto-detects whether the following six
+# secrets are configured on the fitrn repo and chooses its path accordingly:
+#
+#   IOS_P12_BASE64        base64 of your iOS Distribution .p12
+#   IOS_P12_PASSWORD      password for the .p12
+#   APPSTORE_ISSUER_ID    App Store Connect API issuer ID (UUID)
+#   APPSTORE_KEY_ID       App Store Connect API key ID
+#   APPSTORE_PRIVATE_KEY  full contents of the .p8 key file
+#   APPSTORE_TEAM_ID      your 10-character Apple Team ID
+#
+# Optional but recommended:
+#   APPSTORE_BUNDLE_ID    bundle id for provisioning profile download
+#                         (defaults to com.peetrix.fitwayhub)
+#   VITE_API_BASE         Capacitor build will pick this up via env
+#
+# When all six are present, the iOS job produces a real signed .ipa.
+# When any is missing, it falls back to the previous unsigned archive flow.
+
 jobs:
   android:
     name: Build Android APK
@@ -126,7 +144,7 @@ jobs:
           if-no-files-found: error
 
   ios:
-    name: Build iOS IPA
+    name: Build iOS
     runs-on: macos-14
     steps:
       - name: Download project zip
@@ -205,7 +223,6 @@ jobs:
         run: |
           if [ ! -d "ios" ]; then
             if ! npm ls @capacitor/ios --depth=0 >/dev/null 2>&1; then
-              echo ">> @capacitor/ios not installed — installing"
               npm install --no-audit --no-fund @capacitor/ios
             fi
             npx cap add ios
@@ -217,28 +234,15 @@ jobs:
         working-directory: project
         run: |
           set -e
-          echo "=== Capacitor versions ==="
-          npx --no-install cap --version 2>/dev/null || echo "(cap CLI not directly installed)"
-          npm ls @capacitor/core @capacitor/cli @capacitor/ios --depth=0 2>&1 | head -20 || true
-
-          echo "=== ios/ tree BEFORE sync ==="
-          find ios -maxdepth 3 -print 2>/dev/null || echo "(no ios/ dir)"
-
           # If scaffold is incomplete (Podfile missing AND no Package.swift), nuke and regenerate
           if [ ! -f ios/App/Podfile ] && [ ! -f ios/Podfile ] && [ ! -f ios/App/Package.swift ]; then
-            echo ">> ios/ scaffold incomplete — wiping and running 'cap add ios'"
             rm -rf ios
             if ! npm ls @capacitor/ios --depth=0 >/dev/null 2>&1; then
-              echo ">> @capacitor/ios not installed — installing"
               npm install --no-audit --no-fund @capacitor/ios
             fi
             npx cap add ios
           fi
-
           npx cap sync ios
-
-          echo "=== ios/ tree AFTER sync ==="
-          find ios -maxdepth 3 -print 2>/dev/null || true
 
       - name: Expo prebuild (iOS)
         if: steps.detect.outputs.type == 'expo'
@@ -268,7 +272,7 @@ jobs:
           else
             echo "uses_pods=false" >> "$GITHUB_OUTPUT"
           fi
-          echo "Using iOS dir: $candidate (Podfile present: $([ -f "$candidate/Podfile" ] && echo yes || echo no))"
+          echo "Using iOS dir: $candidate"
 
       - name: Install CocoaPods
         if: steps.iosdir.outputs.uses_pods == 'true'
@@ -276,7 +280,127 @@ jobs:
         working-directory: project/${{ steps.iosdir.outputs.dir }}
         run: pod install --repo-update
 
-      - name: Build archive
+      # ── Decide signed vs unsigned path ───────────────────────────────
+      - name: Detect signing configuration
+        id: signing
+        env:
+          HAS_P12: ${{ secrets.IOS_P12_BASE64 != '' }}
+          HAS_PASSWORD: ${{ secrets.IOS_P12_PASSWORD != '' }}
+          HAS_ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID != '' }}
+          HAS_KEY_ID: ${{ secrets.APPSTORE_KEY_ID != '' }}
+          HAS_PRIVATE_KEY: ${{ secrets.APPSTORE_PRIVATE_KEY != '' }}
+          HAS_TEAM_ID: ${{ secrets.APPSTORE_TEAM_ID != '' }}
+        run: |
+          if [ "$HAS_P12" = "true" ] && [ "$HAS_PASSWORD" = "true" ] && \
+             [ "$HAS_ISSUER_ID" = "true" ] && [ "$HAS_KEY_ID" = "true" ] && \
+             [ "$HAS_PRIVATE_KEY" = "true" ] && [ "$HAS_TEAM_ID" = "true" ]; then
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+            echo "Signing secrets present — producing a signed .ipa"
+          else
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "Signing secrets missing — producing an unsigned .ipa for QA only"
+          fi
+
+      # ─────────────────────────── SIGNED DEVICE BUILD ─────────────────
+      - name: Import code-signing certs
+        if: steps.signing.outputs.signed == 'true'
+        uses: apple-actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.IOS_P12_BASE64 }}
+          p12-password: ${{ secrets.IOS_P12_PASSWORD }}
+
+      - name: Download provisioning profile
+        if: steps.signing.outputs.signed == 'true'
+        uses: apple-actions/download-provisioning-profiles@v3
+        with:
+          bundle-id: ${{ secrets.APPSTORE_BUNDLE_ID || 'com.peetrix.fitwayhub' }}
+          issuer-id: ${{ secrets.APPSTORE_ISSUER_ID }}
+          api-key-id: ${{ secrets.APPSTORE_KEY_ID }}
+          api-private-key: ${{ secrets.APPSTORE_PRIVATE_KEY }}
+
+      - name: Write ExportOptions.plist (signed)
+        if: steps.signing.outputs.signed == 'true'
+        shell: bash
+        working-directory: project/${{ steps.iosdir.outputs.dir }}
+        env:
+          TEAM_ID: ${{ secrets.APPSTORE_TEAM_ID }}
+        run: |
+          cat > ExportOptions.plist <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>method</key>
+              <string>app-store</string>
+              <key>teamID</key>
+              <string>${TEAM_ID}</string>
+              <key>signingStyle</key>
+              <string>automatic</string>
+              <key>uploadSymbols</key>
+              <true/>
+              <key>compileBitcode</key>
+              <false/>
+          </dict>
+          </plist>
+          EOF
+
+      - name: Archive (signed, iphoneos)
+        if: steps.signing.outputs.signed == 'true'
+        shell: bash
+        working-directory: project/${{ steps.iosdir.outputs.dir }}
+        env:
+          TEAM_ID: ${{ secrets.APPSTORE_TEAM_ID }}
+        run: |
+          if [ "${{ steps.iosdir.outputs.uses_pods }}" = "true" ]; then
+            CONTAINER=$(ls *.xcworkspace | head -n1)
+            CONTAINER_FLAG="-workspace"
+            SCHEME=$(basename "$CONTAINER" .xcworkspace)
+          else
+            CONTAINER=$(ls *.xcworkspace 2>/dev/null | head -n1)
+            if [ -n "$CONTAINER" ]; then
+              CONTAINER_FLAG="-workspace"
+              SCHEME=$(basename "$CONTAINER" .xcworkspace)
+            else
+              CONTAINER=$(ls *.xcodeproj | head -n1)
+              CONTAINER_FLAG="-project"
+              SCHEME=$(basename "$CONTAINER" .xcodeproj)
+            fi
+          fi
+          echo "Archiving $CONTAINER_FLAG $CONTAINER scheme $SCHEME"
+          xcodebuild \
+            $CONTAINER_FLAG "$CONTAINER" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            -archivePath build/App.xcarchive \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
+            CODE_SIGN_STYLE=Automatic \
+            archive
+
+      - name: Export signed IPA
+        if: steps.signing.outputs.signed == 'true'
+        shell: bash
+        working-directory: project/${{ steps.iosdir.outputs.dir }}
+        run: |
+          xcodebuild \
+            -exportArchive \
+            -archivePath build/App.xcarchive \
+            -exportOptionsPlist ExportOptions.plist \
+            -exportPath build/ipa
+
+      - name: Upload signed IPA
+        if: steps.signing.outputs.signed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-ipa-signed
+          path: project/${{ steps.iosdir.outputs.dir }}/build/ipa/*.ipa
+          if-no-files-found: error
+
+      # ───────────────────── UNSIGNED FALLBACK ARCHIVE ─────────────────
+      - name: Archive (unsigned)
+        if: steps.signing.outputs.signed == 'false'
         shell: bash
         working-directory: project/${{ steps.iosdir.outputs.dir }}
         run: |
@@ -295,7 +419,6 @@ jobs:
               SCHEME=$(basename "$CONTAINER" .xcodeproj)
             fi
           fi
-          echo "Building $CONTAINER_FLAG $CONTAINER scheme $SCHEME"
           xcodebuild \
             $CONTAINER_FLAG "$CONTAINER" \
             -scheme "$SCHEME" \
@@ -307,6 +430,7 @@ jobs:
             archive
 
       - name: Package unsigned IPA
+        if: steps.signing.outputs.signed == 'false'
         shell: bash
         working-directory: project/${{ steps.iosdir.outputs.dir }}
         run: |
@@ -314,9 +438,10 @@ jobs:
           cp -R build/App.xcarchive/Products/Applications/*.app build/ipa/Payload/
           cd build/ipa && zip -qr ../App.ipa Payload
 
-      - name: Upload IPA
+      - name: Upload unsigned IPA
+        if: steps.signing.outputs.signed == 'false'
         uses: actions/upload-artifact@v4
         with:
-          name: ios-ipa
+          name: ios-ipa-unsigned
           path: project/${{ steps.iosdir.outputs.dir }}/build/App.ipa
           if-no-files-found: error
