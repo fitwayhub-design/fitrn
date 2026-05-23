@@ -24,7 +24,9 @@ on:
 #   VITE_API_BASE         Capacitor build will pick this up via env
 #
 # When all six are present, the iOS job produces a real signed .ipa.
-# When any is missing, it falls back to the previous unsigned archive flow.
+# When any is missing, it falls back to an unsigned device .ipa (the
+# proper Payload/App.app/ container) suitable for AltStore / Sideloadly /
+# Apple Configurator / Xcode "Install from .ipa" re-signing.
 
 jobs:
   android:
@@ -280,9 +282,14 @@ jobs:
         working-directory: project/${{ steps.iosdir.outputs.dir }}
         run: pod install --repo-update
 
-      # ── Decide signed vs unsigned path ───────────────────────────────
+      # ── Decide signed vs unsigned path. Single-line `if` + set +e + explicit
+      #    exit 0 so this step can never tank the workflow regardless of which
+      #    secrets are or aren't present. (The old version used && with line
+      #    continuations and could fail under bash strict mode, producing a
+      #    cryptic 0s exit-1 with no real diagnostic.)
       - name: Detect signing configuration
         id: signing
+        shell: bash
         env:
           HAS_P12: ${{ secrets.IOS_P12_BASE64 != '' }}
           HAS_PASSWORD: ${{ secrets.IOS_P12_PASSWORD != '' }}
@@ -291,15 +298,18 @@ jobs:
           HAS_PRIVATE_KEY: ${{ secrets.APPSTORE_PRIVATE_KEY != '' }}
           HAS_TEAM_ID: ${{ secrets.APPSTORE_TEAM_ID != '' }}
         run: |
-          if [ "$HAS_P12" = "true" ] && [ "$HAS_PASSWORD" = "true" ] && \
-             [ "$HAS_ISSUER_ID" = "true" ] && [ "$HAS_KEY_ID" = "true" ] && \
-             [ "$HAS_PRIVATE_KEY" = "true" ] && [ "$HAS_TEAM_ID" = "true" ]; then
-            echo "signed=true" >> "$GITHUB_OUTPUT"
+          set +e
+          SIGNED=false
+          if [ "$HAS_P12" = "true" ] && [ "$HAS_PASSWORD" = "true" ] && [ "$HAS_ISSUER_ID" = "true" ] && [ "$HAS_KEY_ID" = "true" ] && [ "$HAS_PRIVATE_KEY" = "true" ] && [ "$HAS_TEAM_ID" = "true" ]; then
+            SIGNED=true
+          fi
+          echo "signed=$SIGNED" >> "$GITHUB_OUTPUT"
+          if [ "$SIGNED" = "true" ]; then
             echo "Signing secrets present — producing a signed .ipa"
           else
-            echo "signed=false" >> "$GITHUB_OUTPUT"
-            echo "Signing secrets missing — producing an unsigned .ipa for QA only"
+            echo "Signing secrets missing — producing an unsigned .ipa for re-signing tools (AltStore/Sideloadly/Xcode)"
           fi
+          exit 0
 
       # ─────────────────────────── SIGNED DEVICE BUILD ─────────────────
       - name: Import code-signing certs
@@ -399,6 +409,8 @@ jobs:
           if-no-files-found: error
 
       # ───────────────────── UNSIGNED FALLBACK ARCHIVE ─────────────────
+      # Full CODE_SIGN_* opt-outs so the archive step doesn't trip over
+      # missing certs / provisioning profiles on the runner.
       - name: Archive (unsigned)
         if: steps.signing.outputs.signed == 'false'
         shell: bash
@@ -424,9 +436,16 @@ jobs:
             -scheme "$SCHEME" \
             -configuration Release \
             -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
             -derivedDataPath build \
             -archivePath build/App.xcarchive \
             CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            EXPANDED_CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
             archive
 
       - name: Package unsigned IPA
@@ -434,9 +453,16 @@ jobs:
         shell: bash
         working-directory: project/${{ steps.iosdir.outputs.dir }}
         run: |
+          APP_PATH=$(ls -d build/App.xcarchive/Products/Applications/*.app 2>/dev/null | head -n1)
+          if [ -z "$APP_PATH" ] || [ ! -d "$APP_PATH" ]; then
+            echo "::error::No .app found inside the archive"
+            find build/App.xcarchive -maxdepth 4 -print 2>/dev/null || true
+            exit 1
+          fi
           mkdir -p build/ipa/Payload
-          cp -R build/App.xcarchive/Products/Applications/*.app build/ipa/Payload/
+          cp -R "$APP_PATH" build/ipa/Payload/
           cd build/ipa && zip -qr ../App.ipa Payload
+          ls -lh ../App.ipa
 
       - name: Upload unsigned IPA
         if: steps.signing.outputs.signed == 'false'
