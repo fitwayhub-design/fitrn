@@ -8,14 +8,11 @@ on:
         required: true
         type: string
 
-# Opt into Node.js 24 for JavaScript actions so the upload-artifact@v4
-# deprecation warning goes away. Remove once upload-artifact ships v5
-# with native Node 24 support.
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 # iOS signing (optional). The job auto-detects whether the following six
-# secrets are configured on the fitrn repo and chooses its path accordingly:
+# secrets are configured and chooses its path accordingly:
 #
 #   IOS_P12_BASE64        base64 of your iOS Distribution .p12
 #   IOS_P12_PASSWORD      password for the .p12
@@ -24,15 +21,10 @@ env:
 #   APPSTORE_PRIVATE_KEY  full contents of the .p8 key file
 #   APPSTORE_TEAM_ID      your 10-character Apple Team ID
 #
-# Optional but recommended:
+# Optional:
 #   APPSTORE_BUNDLE_ID    bundle id for provisioning profile download
 #                         (defaults to com.peetrix.fitwayhub)
-#   VITE_API_BASE         Capacitor build will pick this up via env
-#
-# When all six are present, the iOS job produces a real signed .ipa.
-# When any is missing, it falls back to an unsigned device .ipa (the
-# proper Payload/App.app/ container) suitable for AltStore / Sideloadly /
-# Apple Configurator / Xcode "Install from .ipa" re-signing.
+#   VITE_API_BASE         baked into the Capacitor web bundle
 
 jobs:
   android:
@@ -75,7 +67,6 @@ jobs:
             ls -la
             exit 1
           fi
-          echo "Detected project type: $(cat "$GITHUB_OUTPUT" | grep ^type=)"
 
       - name: Set up Node.js 22
         uses: actions/setup-node@v5
@@ -242,7 +233,6 @@ jobs:
         working-directory: project
         run: |
           set -e
-          # If scaffold is incomplete (Podfile missing AND no Package.swift), nuke and regenerate
           if [ ! -f ios/App/Podfile ] && [ ! -f ios/Podfile ] && [ ! -f ios/App/Package.swift ]; then
             rm -rf ios
             if ! npm ls @capacitor/ios --depth=0 >/dev/null 2>&1; then
@@ -281,16 +271,25 @@ jobs:
             echo "uses_pods=false" >> "$GITHUB_OUTPUT"
           fi
           echo "Using iOS dir: $candidate"
+          echo "── Contents of $candidate ──"
+          ls -la "$candidate"
 
+      # CocoaPods unconditionally if a Podfile exists at the located dir —
+      # the previous `if: uses_pods == 'true'` gating was based purely on
+      # the Locate step's output, but if that output got mis-computed for
+      # any reason, pod install was silently skipped and xcodebuild later
+      # failed trying to resolve Pods.xcconfig.
       - name: Install CocoaPods
-        if: steps.iosdir.outputs.uses_pods == 'true'
         shell: bash
         working-directory: project/${{ steps.iosdir.outputs.dir }}
-        run: pod install --repo-update
+        run: |
+          if [ -f Podfile ]; then
+            pod install --repo-update
+          else
+            echo "No Podfile in $(pwd); skipping pod install (likely SPM-based)"
+          fi
 
-      # ── Decide signed vs unsigned path. Single-line `if` + set +e + explicit
-      #    exit 0 so this step can never tank the workflow regardless of which
-      #    secrets are or aren't present.
+      # ── Decide signed vs unsigned path ───────────────────────────────
       - name: Detect signing configuration
         id: signing
         shell: bash
@@ -365,20 +364,12 @@ jobs:
         env:
           TEAM_ID: ${{ secrets.APPSTORE_TEAM_ID }}
         run: |
-          if [ "${{ steps.iosdir.outputs.uses_pods }}" = "true" ]; then
-            CONTAINER=$(ls *.xcworkspace | head -n1)
-            CONTAINER_FLAG="-workspace"
-            SCHEME=$(basename "$CONTAINER" .xcworkspace)
+          CONTAINER=$(ls -1 *.xcworkspace 2>/dev/null | head -n1)
+          if [ -n "$CONTAINER" ]; then
+            CONTAINER_FLAG="-workspace"; SCHEME=$(basename "$CONTAINER" .xcworkspace)
           else
-            CONTAINER=$(ls *.xcworkspace 2>/dev/null | head -n1)
-            if [ -n "$CONTAINER" ]; then
-              CONTAINER_FLAG="-workspace"
-              SCHEME=$(basename "$CONTAINER" .xcworkspace)
-            else
-              CONTAINER=$(ls *.xcodeproj | head -n1)
-              CONTAINER_FLAG="-project"
-              SCHEME=$(basename "$CONTAINER" .xcodeproj)
-            fi
+            CONTAINER=$(ls -1 *.xcodeproj 2>/dev/null | head -n1)
+            CONTAINER_FLAG="-project"; SCHEME=$(basename "$CONTAINER" .xcodeproj)
           fi
           echo "Archiving $CONTAINER_FLAG $CONTAINER scheme $SCHEME"
           xcodebuild \
@@ -413,30 +404,38 @@ jobs:
           if-no-files-found: error
 
       # ───────────────────── UNSIGNED FALLBACK BUILD ──────────────────
-      # NOTE: must be `build`, not `archive`. Xcode 15+ refuses to archive
-      # when signing is disabled even with CODE_SIGNING_ALLOWED=NO. We
-      # build instead and pull the .app straight out of Release-iphoneos.
+      # NOTE: must be `build`, not `archive`. Xcode 15+ rejects `archive`
+      # when signing is disabled.
+      #
+      # Two protective measures vs the earlier silent failure mode:
+      #   - set +e and `2>/dev/null` everywhere on `ls`, so a missing
+      #     glob match can't propagate through pipefail and kill the
+      #     script before any diagnostic output.
+      #   - Pipe xcodebuild through `tee` to a logfile AND echo what we
+      #     found so the failure reason is always visible in CI output.
       - name: Build (unsigned)
         if: steps.signing.outputs.signed == 'false'
         shell: bash
         working-directory: project/${{ steps.iosdir.outputs.dir }}
         run: |
-          if [ "${{ steps.iosdir.outputs.uses_pods }}" = "true" ]; then
-            CONTAINER=$(ls *.xcworkspace | head -n1)
-            CONTAINER_FLAG="-workspace"
-            SCHEME=$(basename "$CONTAINER" .xcworkspace)
+          set +e
+          echo "── pwd ──"; pwd
+          echo "── ls -la ──"; ls -la
+          CONTAINER=$(ls -1 *.xcworkspace 2>/dev/null | head -n1)
+          if [ -n "$CONTAINER" ]; then
+            CONTAINER_FLAG="-workspace"; SCHEME=$(basename "$CONTAINER" .xcworkspace)
           else
-            CONTAINER=$(ls *.xcworkspace 2>/dev/null | head -n1)
-            if [ -n "$CONTAINER" ]; then
-              CONTAINER_FLAG="-workspace"
-              SCHEME=$(basename "$CONTAINER" .xcworkspace)
-            else
-              CONTAINER=$(ls *.xcodeproj | head -n1)
-              CONTAINER_FLAG="-project"
-              SCHEME=$(basename "$CONTAINER" .xcodeproj)
+            CONTAINER=$(ls -1 *.xcodeproj 2>/dev/null | head -n1)
+            if [ -z "$CONTAINER" ]; then
+              echo "::error::No .xcworkspace or .xcodeproj found in $(pwd)"
+              exit 1
             fi
+            CONTAINER_FLAG="-project"; SCHEME=$(basename "$CONTAINER" .xcodeproj)
           fi
-          echo "Building $CONTAINER_FLAG $CONTAINER scheme $SCHEME (unsigned, iphoneos)"
+          echo "── Available schemes ──"
+          xcodebuild $CONTAINER_FLAG "$CONTAINER" -list 2>&1 | head -40 || true
+          echo "── Building $CONTAINER_FLAG $CONTAINER scheme $SCHEME (unsigned, iphoneos) ──"
+          set -o pipefail
           xcodebuild \
             $CONTAINER_FLAG "$CONTAINER" \
             -scheme "$SCHEME" \
@@ -452,7 +451,13 @@ jobs:
             DEVELOPMENT_TEAM="" \
             PROVISIONING_PROFILE_SPECIFIER="" \
             ONLY_ACTIVE_ARCH=NO \
-            build
+            build 2>&1 | tee build.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" != "0" ]; then
+            echo "::error::xcodebuild exited with $rc — last 80 lines of build.log:"
+            tail -80 build.log || true
+            exit "$rc"
+          fi
 
       - name: Package unsigned IPA
         if: steps.signing.outputs.signed == 'false'
