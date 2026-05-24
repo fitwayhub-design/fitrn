@@ -233,7 +233,7 @@ jobs:
         working-directory: project
         run: |
           set -e
-          if [ ! -f ios/App/Podfile ] && [ ! -f ios/Podfile ] && [ ! -f ios/App/Package.swift ]; then
+          if [ ! -f ios/App/Podfile ] && [ ! -f ios/Podfile ] && [ ! -d ios/App/CapApp-SPM ] && [ ! -f ios/App/Package.swift ]; then
             rm -rf ios
             if ! npm ls @capacitor/ios --depth=0 >/dev/null 2>&1; then
               npm install --no-audit --no-fund @capacitor/ios
@@ -253,8 +253,10 @@ jobs:
         working-directory: project
         run: |
           candidate=""
+          # Xcode projects/workspaces are DIRECTORIES; use -d so the glob
+          # check doesn't treat their contents as separate matches.
           for d in ios/App ios; do
-            if ls "$d"/*.xcworkspace >/dev/null 2>&1 || ls "$d"/*.xcodeproj >/dev/null 2>&1; then
+            if ls -d "$d"/*.xcworkspace >/dev/null 2>&1 || ls -d "$d"/*.xcodeproj >/dev/null 2>&1; then
               candidate="$d"
               break
             fi
@@ -274,11 +276,10 @@ jobs:
           echo "── Contents of $candidate ──"
           ls -la "$candidate"
 
-      # CocoaPods unconditionally if a Podfile exists at the located dir —
-      # the previous `if: uses_pods == 'true'` gating was based purely on
-      # the Locate step's output, but if that output got mis-computed for
-      # any reason, pod install was silently skipped and xcodebuild later
-      # failed trying to resolve Pods.xcconfig.
+      # Run CocoaPods unconditionally — gated only on a Podfile actually
+      # existing at the located dir. Modern Capacitor (6+) defaults to
+      # Swift Package Manager (CapApp-SPM/, no Podfile), in which case
+      # we skip and let xcodebuild resolve packages on its own.
       - name: Install CocoaPods
         shell: bash
         working-directory: project/${{ steps.iosdir.outputs.dir }}
@@ -286,7 +287,7 @@ jobs:
           if [ -f Podfile ]; then
             pod install --repo-update
           else
-            echo "No Podfile in $(pwd); skipping pod install (likely SPM-based)"
+            echo "No Podfile in $(pwd); SPM-based Capacitor project, skipping pod install."
           fi
 
       # ── Decide signed vs unsigned path ───────────────────────────────
@@ -364,11 +365,16 @@ jobs:
         env:
           TEAM_ID: ${{ secrets.APPSTORE_TEAM_ID }}
         run: |
-          CONTAINER=$(ls -1 *.xcworkspace 2>/dev/null | head -n1)
+          # ls -1d treats *.xcworkspace / *.xcodeproj as directories
+          # (which they are) and prints the dir name itself rather than
+          # listing its contents. Without -d we'd get "project.pbxproj"
+          # back and xcodebuild would fail with "project.pbxproj does
+          # not exist".
+          CONTAINER=$(ls -1d *.xcworkspace 2>/dev/null | head -n1)
           if [ -n "$CONTAINER" ]; then
             CONTAINER_FLAG="-workspace"; SCHEME=$(basename "$CONTAINER" .xcworkspace)
           else
-            CONTAINER=$(ls -1 *.xcodeproj 2>/dev/null | head -n1)
+            CONTAINER=$(ls -1d *.xcodeproj 2>/dev/null | head -n1)
             CONTAINER_FLAG="-project"; SCHEME=$(basename "$CONTAINER" .xcodeproj)
           fi
           echo "Archiving $CONTAINER_FLAG $CONTAINER scheme $SCHEME"
@@ -406,13 +412,6 @@ jobs:
       # ───────────────────── UNSIGNED FALLBACK BUILD ──────────────────
       # NOTE: must be `build`, not `archive`. Xcode 15+ rejects `archive`
       # when signing is disabled.
-      #
-      # Two protective measures vs the earlier silent failure mode:
-      #   - set +e and `2>/dev/null` everywhere on `ls`, so a missing
-      #     glob match can't propagate through pipefail and kill the
-      #     script before any diagnostic output.
-      #   - Pipe xcodebuild through `tee` to a logfile AND echo what we
-      #     found so the failure reason is always visible in CI output.
       - name: Build (unsigned)
         if: steps.signing.outputs.signed == 'false'
         shell: bash
@@ -421,11 +420,16 @@ jobs:
           set +e
           echo "── pwd ──"; pwd
           echo "── ls -la ──"; ls -la
-          CONTAINER=$(ls -1 *.xcworkspace 2>/dev/null | head -n1)
+          # CRITICAL: -d on ls. Xcode project/workspace bundles ARE
+          # directories; without -d, `ls *.xcodeproj` lists the contents
+          # of App.xcodeproj/ (project.pbxproj, xcshareddata/, etc.) and
+          # CONTAINER ends up as "project.pbxproj" — which xcodebuild
+          # then can't find at the top of the directory.
+          CONTAINER=$(ls -1d *.xcworkspace 2>/dev/null | head -n1)
           if [ -n "$CONTAINER" ]; then
             CONTAINER_FLAG="-workspace"; SCHEME=$(basename "$CONTAINER" .xcworkspace)
           else
-            CONTAINER=$(ls -1 *.xcodeproj 2>/dev/null | head -n1)
+            CONTAINER=$(ls -1d *.xcodeproj 2>/dev/null | head -n1)
             if [ -z "$CONTAINER" ]; then
               echo "::error::No .xcworkspace or .xcodeproj found in $(pwd)"
               exit 1
@@ -433,7 +437,7 @@ jobs:
             CONTAINER_FLAG="-project"; SCHEME=$(basename "$CONTAINER" .xcodeproj)
           fi
           echo "── Available schemes ──"
-          xcodebuild $CONTAINER_FLAG "$CONTAINER" -list 2>&1 | head -40 || true
+          xcodebuild $CONTAINER_FLAG "$CONTAINER" -list 2>&1 | head -60 || true
           echo "── Building $CONTAINER_FLAG $CONTAINER scheme $SCHEME (unsigned, iphoneos) ──"
           set -o pipefail
           xcodebuild \
@@ -454,8 +458,8 @@ jobs:
             build 2>&1 | tee build.log
           rc=${PIPESTATUS[0]}
           if [ "$rc" != "0" ]; then
-            echo "::error::xcodebuild exited with $rc — last 80 lines of build.log:"
-            tail -80 build.log || true
+            echo "::error::xcodebuild exited with $rc — last 100 lines of build.log:"
+            tail -100 build.log || true
             exit "$rc"
           fi
 
