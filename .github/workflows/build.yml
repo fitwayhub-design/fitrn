@@ -242,6 +242,47 @@ jobs:
           fi
           npx cap sync ios
 
+      # ── Pin SPM capacitor-swift-pm to the installed @capacitor/core version
+      # Capacitor's per-plugin Swift packages live under node_modules and must
+      # be compiled against a matching capacitor-swift-pm. If the uploaded zip
+      # ships a stale CapApp-SPM/Package.swift (e.g. pinned to 8.0.0 from an
+      # earlier failed attempt) the resolver picks that version and the plugin
+      # code stops compiling (e.g. CAPBridgeProtocol.webView removed in 8.x,
+      # PluginConfig.getString renamed, getInt/getBool default-arg required,
+      # UIColor.capacitor.color label change). Force-rewrite the pin to the
+      # version of @capacitor/core actually installed by npm, and wipe any
+      # cached SPM Package.resolved so SPM re-resolves cleanly.
+      - name: Pin capacitor-swift-pm to installed core version
+        if: steps.detect.outputs.type == 'capacitor'
+        shell: bash
+        working-directory: project
+        run: |
+          set -e
+          PKG=ios/App/CapApp-SPM/Package.swift
+          [ -f "$PKG" ] || { echo "No SPM Package.swift at $PKG; nothing to pin."; exit 0; }
+          CORE_VER=$(node -p "require('./node_modules/@capacitor/core/package.json').version")
+          echo "Pinning capacitor-swift-pm to $CORE_VER (from installed @capacitor/core)"
+          # Replace the entire capacitor-swift-pm dependency line, regardless
+          # of whether it currently uses exact:/from:/branch:/etc.
+          python3 - "$PKG" "$CORE_VER" <<'PY'
+          import re, sys, pathlib
+          path, ver = sys.argv[1], sys.argv[2]
+          p = pathlib.Path(path)
+          src = p.read_text()
+          new = re.sub(
+              r'\.package\(\s*url:\s*"https://github\.com/ionic-team/capacitor-swift-pm\.git"[^)]*\)',
+              f'.package(url: "https://github.com/ionic-team/capacitor-swift-pm.git", exact: "{ver}")',
+              src,
+          )
+          p.write_text(new)
+          print(new)
+          PY
+          # Wipe stale resolved files so SPM re-resolves against the new pin.
+          rm -f ios/App/CapApp-SPM/Package.resolved
+          rm -f ios/App/App.xcworkspace/xcshareddata/swiftpm/Package.resolved
+          rm -f ios/App/App.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
+          rm -rf ios/App/build/SourcePackages
+
       - name: Expo prebuild (iOS)
         if: steps.detect.outputs.type == 'expo'
         working-directory: project
